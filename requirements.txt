@@ -1,0 +1,21 @@
+# ── Core inference ──────────────────────────────────────────────────────────
+onnxruntime>=1.18.0           # CPU inference engine
+numpy>=1.24.0
+opencv-python>=4.9.0
+Pillow>=10.0.0
+
+# ── Model download & export ──────────────────────────────────────────────────
+huggingface_hub>=0.23.0       # download Depth Anything V2 weights
+gdown>=5.1.0                  # download YOLOPv2 weights from Google Drive
+torch>=2.2.0                  # only needed for ONNX export step, not live demo
+torchvision>=0.17.0
+
+# ── TTS ──────────────────────────────────────────────────────────────────────
+kokoro>=0.9.2                 # offline TTS, 82M params
+sounddevice>=0.4.6            # audio playback
+soundfile>=0.12.1
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+scipy>=1.12.0                 # DBSCAN for lane clustering
+tqdm>=4.66.0
+pyyaml>=6.0
