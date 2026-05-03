@@ -4,18 +4,24 @@ download_models.py
 Run once before starting the live demo:
     python scripts/download_models.py
 
-Downloads YOLOPv2 weights, exports to ONNX, then downloads and exports
-Depth Anything V2 Small to ONNX. All final files land in models/.
+What this does:
+  1. Downloads YOLOPv2 as a pre-exported ONNX directly from GitHub releases
+     (no .pt weights, no PyTorch export step needed)
+  2. Downloads Depth Anything V2 Small checkpoint from HuggingFace and
+     exports it to ONNX using the legacy torch.onnx exporter
+  3. INT8-quantizes both ONNX models for faster CPU inference
+
+All final files land in models/.
 """
 
-import os
 import sys
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT       = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -38,39 +44,40 @@ def already_exists(path: Path, label: str) -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1 — YOLOPv2
+#
+# The official CAIC-AD Google Drive link is dead.
+# We download the pre-exported ONNX directly from the Kazuhito00 community
+# inference repo (MIT licence), which ships the ONNX in its GitHub releases.
+# Input size for this export: 640x640 (square).
 # ─────────────────────────────────────────────────────────────────────────────
+
+YOLOPV2_ONNX_URL = (
+    "https://github.com/Kazuhito00/YOLOPv2-ONNX-Sample"
+    "/releases/download/v0.0.0/YOLOPv2.onnx"
+)
+
 
 def download_yolopv2():
     onnx_path = MODELS_DIR / "yolopv2.onnx"
     if already_exists(onnx_path, "YOLOPv2 ONNX"):
         return
 
-    pt_path = MODELS_DIR / "yolopv2.pt"
-    repo_dir = ROOT / "_yolopv2_repo"
-
-    # Clone the official repo (needed for export script)
-    if not repo_dir.exists():
-        run(f"git clone https://github.com/CAIC-AD/YOLOPv2 {repo_dir}")
-
-    # Download pretrained weights via gdown (Google Drive ID from official repo)
-    if not pt_path.exists():
-        print("\n[YOLOPv2] Downloading pretrained weights (~38 MB)…")
-        run(f"gdown --id 1RG0HEXuonGKwLNOSVxSMqEHVQNRkqNE8 -O {pt_path}")
-
-    # Export to ONNX using the repo's own export script
-    print("\n[YOLOPv2] Exporting to ONNX…")
-    run(
-        f"python {repo_dir}/tools/export.py "
-        f"--weights {pt_path} "
-        f"--img-size 640 384 "
-        f"--batch-size 1 "
-        f"--output-path {MODELS_DIR}"
-    )
+    print("\n[YOLOPv2] Downloading pre-exported ONNX (~38 MB)...")
+    run(f'wget -O "{onnx_path}" "{YOLOPV2_ONNX_URL}"')
     print(f"[OK] YOLOPv2 ONNX saved to {onnx_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2 — Depth Anything V2 Small
+#
+# DINOv2 patch embeddings require H and W to be exact multiples of 14.
+#   384 / 14 = 27.43  <- crashes
+#   392 / 14 = 28.00  <- OK
+#   640 / 14 = 45.71  <- crashes
+#   630 / 14 = 45.00  <- OK
+#
+# Export uses dynamo=False to force the legacy torch.onnx exporter.
+# PyTorch 2.x defaults to torch.export which fails on dynamic ViT ops.
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEPTH_EXPORT_SCRIPT = """
@@ -81,18 +88,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path("{repo}").resolve()))
 from depth_anything_v2.dpt import DepthAnythingV2
 
-model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48,96,192,384])
-ckpt = torch.load("{ckpt}", map_location="cpu")
+model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384])
+ckpt  = torch.load("{ckpt}", map_location="cpu")
 model.load_state_dict(ckpt)
 model.eval()
 
-dummy = torch.zeros(1, 3, 384, 640)
+# 392 = 28x14,  630 = 45x14  -- both divisible by DINOv2 patch size (14)
+dummy = torch.zeros(1, 3, 392, 630)
+
 torch.onnx.export(
-    model, dummy, "{out}",
+    model,
+    dummy,
+    "{out}",
     input_names=["image"],
     output_names=["depth"],
-    opset_version=17,
-    dynamic_axes={{"image": {{0:"batch"}}, "depth": {{0:"batch"}}}},
+    opset_version=16,
+    dynamo=False,             # legacy exporter -- avoids torch.export failures
+    do_constant_folding=True,
 )
 print("[OK] Depth Anything V2 Small ONNX exported.")
 """
@@ -104,16 +116,16 @@ def download_depth_anything():
         return
 
     ckpt_path = MODELS_DIR / "depth_anything_v2_vits.pth"
-    repo_dir = ROOT / "_depth_anything_repo"
+    repo_dir  = ROOT / "_depth_anything_repo"
 
     # Clone repo
     if not repo_dir.exists():
         run(f"git clone https://github.com/DepthAnything/Depth-Anything-V2 {repo_dir}")
         run(f"pip install -r {repo_dir}/requirements.txt -q")
 
-    # Download weights via huggingface_hub
+    # Download checkpoint from HuggingFace
     if not ckpt_path.exists():
-        print("\n[Depth] Downloading Depth Anything V2 Small checkpoint (~100 MB)…")
+        print("\n[Depth] Downloading Depth Anything V2 Small checkpoint (~100 MB)...")
         from huggingface_hub import hf_hub_download
         downloaded = hf_hub_download(
             repo_id="depth-anything/Depth-Anything-V2-Small",
@@ -122,7 +134,7 @@ def download_depth_anything():
         )
         print(f"[Depth] Checkpoint saved to {downloaded}")
 
-    # Write and run export script
+    # Write tmp export script and run it
     export_code = DEPTH_EXPORT_SCRIPT.format(
         repo=repo_dir,
         ckpt=ckpt_path,
@@ -136,7 +148,7 @@ def download_depth_anything():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3 — Quantize both ONNX models to INT8 (halves memory, +30% speed)
+# Step 3 -- INT8 quantization (halves model size, ~30% faster on CPU)
 # ─────────────────────────────────────────────────────────────────────────────
 
 QUANT_SCRIPT = """
@@ -163,19 +175,19 @@ def quantize(model_name: str):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Self-driving perception — model download + export")
+    print("  Self-driving perception -- model download + export")
     print("=" * 60)
 
-    print("\n[1/4] YOLOPv2 weights + ONNX export")
+    print("\n[1/4] YOLOPv2 -- direct ONNX download")
     download_yolopv2()
 
-    print("\n[2/4] Depth Anything V2 Small weights + ONNX export")
+    print("\n[2/4] Depth Anything V2 Small -- checkpoint + ONNX export")
     download_depth_anything()
 
-    print("\n[3/4] INT8 quantization — YOLOPv2")
+    print("\n[3/4] INT8 quantization -- YOLOPv2")
     quantize("yolopv2")
 
-    print("\n[4/4] INT8 quantization — Depth Anything V2 Small")
+    print("\n[4/4] INT8 quantization -- Depth Anything V2 Small")
     quantize("depth_anything_v2_small")
 
     print("\n" + "=" * 60)
