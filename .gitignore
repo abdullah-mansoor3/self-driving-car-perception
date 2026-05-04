@@ -4,6 +4,8 @@ _yolopv2_repo/
 _depth_anything_repo/
 _export_depth_tmp.py
 _quant_tmp.py
+test_footage/
+_depth_anything_repo/
 
 # Python
 __pycache__/

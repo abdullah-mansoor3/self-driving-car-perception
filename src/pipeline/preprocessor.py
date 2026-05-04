@@ -12,11 +12,14 @@ import numpy as np
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-YOLO_W, YOLO_H   = 640, 384   # YOLOPv2 fixed input
-DEPTH_W, DEPTH_H = 640, 384   # Depth Anything V2 Small — same for simplicity
+YOLO_W, YOLO_H   = 640, 640   # YOLOPv2 fixed input (Kazuhito00 ONNX export)
+DEPTH_W, DEPTH_H = 630, 392   # Depth Anything V2 Small (both divisible by 14)
 
 
-def preprocess(bgr_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple]:
+def preprocess(
+    bgr_frame: np.ndarray,
+    depth_size: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, tuple]:
     """
     Parameters
     ----------
@@ -24,8 +27,8 @@ def preprocess(bgr_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple]:
 
     Returns
     -------
-    yolo_tensor  : (1, 3, 384, 640) float32 — feed to YOLOPv2
-    depth_tensor : (1, 3, 384, 640) float32 — feed to Depth Anything
+    yolo_tensor  : (1, 3, 640, 640) float32 — feed to YOLOPv2
+    depth_tensor : (1, 3, H, W) float32 — feed to Depth Anything
     orig_shape   : (orig_H, orig_W) — needed to scale detections back
     """
     orig_shape = bgr_frame.shape[:2]
@@ -33,16 +36,20 @@ def preprocess(bgr_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple]:
     # Convert BGR → RGB
     rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
 
-    # Resize
-    resized = cv2.resize(rgb, (YOLO_W, YOLO_H), interpolation=cv2.INTER_LINEAR)
+    # Resize for YOLO (640x640)
+    yolo_resized = cv2.resize(rgb, (YOLO_W, YOLO_H), interpolation=cv2.INTER_LINEAR)
+    yolo_norm = (yolo_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+    yolo_chw = yolo_norm.transpose(2, 0, 1)
+    yolo_tensor = np.expand_dims(yolo_chw, axis=0)
 
-    # Normalize and convert to float32
-    normalized = (resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+    # Resize for Depth (default 392x630)
+    if depth_size is None:
+        depth_w, depth_h = DEPTH_W, DEPTH_H
+    else:
+        depth_w, depth_h = depth_size
+    depth_resized = cv2.resize(rgb, (depth_w, depth_h), interpolation=cv2.INTER_LINEAR)
+    depth_norm = (depth_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+    depth_chw = depth_norm.transpose(2, 0, 1)
+    depth_tensor = np.expand_dims(depth_chw, axis=0)
 
-    # HWC → CHW → add batch dim
-    chw = normalized.transpose(2, 0, 1)
-    tensor = np.expand_dims(chw, axis=0)  # (1, 3, H, W)
-
-    # Both models take the same tensor here; depth model may later use a
-    # different resolution if you swap it out, so we keep them separate.
-    return tensor.copy(), tensor.copy(), orig_shape
+    return yolo_tensor, depth_tensor, orig_shape

@@ -74,7 +74,7 @@ python scripts/download_models.py
 ---
 
 ## Run the demo
-
+ 
 ```bash
 # Webcam
 python demo.py --source 0

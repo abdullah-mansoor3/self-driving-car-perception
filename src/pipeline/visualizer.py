@@ -46,7 +46,7 @@ def draw(
     # ── Depth map thumbnail (top-right corner) ────────────────────────────
     if depth_map is not None:
         h, w = out.shape[:2]
-        thumb_w, thumb_h = 160, 96
+        thumb_w, thumb_h = 240, 144
         depth_u8 = (depth_map * 255).astype(np.uint8)
         depth_colored = cv2.applyColorMap(depth_u8, cv2.COLORMAP_MAGMA)
         depth_thumb = cv2.resize(depth_colored, (thumb_w, thumb_h))
