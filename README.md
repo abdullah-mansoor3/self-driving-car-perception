@@ -51,6 +51,7 @@ pip install -r requirements.txt
 
 # 5. Download + export + quantize all models  (~15 min, ~200 MB download)
 python scripts/download_models.py
+
 ```
 
 ### What the download script does
