@@ -11,19 +11,29 @@ import threading
 import numpy as np
 import onnxruntime as ort
 import cv2
+import os
 
 
 class DepthEstimator:
     def __init__(self, onnx_path: str, skip_frames: int = 3):
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 2
+        opts.intra_op_num_threads = min(6, max(1, (os.cpu_count() or 4) // 2))
+        opts.inter_op_num_threads = 1
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        self.session     = ort.InferenceSession(onnx_path, sess_options=opts,
-                                                providers=["CPUExecutionProvider"])
+        providers = ort.get_available_providers()
+        provider_chain = []
+        if "CUDAExecutionProvider" in providers:
+            provider_chain.append("CUDAExecutionProvider")
+        provider_chain.append("CPUExecutionProvider")
+        self.session = ort.InferenceSession(
+            onnx_path,
+            sess_options=opts,
+            providers=provider_chain,
+        )
         self.input_name  = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
-        self.skip_frames = skip_frames
+        self.skip_frames = max(1, int(skip_frames))
 
         # Shared state
         self._depth_map  = None          # latest normalized depth (H, W) float32
@@ -31,7 +41,8 @@ class DepthEstimator:
         self._frame_idx  = 0
         self._thread     = None
 
-        print(f"[Depth] Loaded from {onnx_path}  (skip_frames={skip_frames})")
+        print(f"[Depth] Loaded from {onnx_path}  (skip_frames={self.skip_frames})")
+        print(f"       Providers: {self.session.get_providers()}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -52,6 +63,17 @@ class DepthEstimator:
                 )
                 t.start()
                 self._thread = t
+
+    def should_infer_next(self) -> bool:
+        """True when the next update() call should enqueue a depth run."""
+        next_idx = self._frame_idx + 1
+        if next_idx % self.skip_frames != 0:
+            return False
+        return self._thread is None or not self._thread.is_alive()
+
+    def mark_frame_processed(self):
+        """Advance frame index when no depth tensor was submitted."""
+        self._frame_idx += 1
 
     def get_depth_map(self) -> np.ndarray | None:
         """

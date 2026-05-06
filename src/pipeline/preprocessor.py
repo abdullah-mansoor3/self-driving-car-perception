@@ -16,6 +16,32 @@ YOLO_W, YOLO_H   = 640, 640   # YOLOPv2 fixed input (Kazuhito00 ONNX export)
 DEPTH_W, DEPTH_H = 630, 392   # Depth Anything V2 Small (both divisible by 14)
 
 
+def preprocess_yolo(
+    bgr_frame: np.ndarray,
+) -> tuple[np.ndarray, tuple]:
+    orig_shape = bgr_frame.shape[:2]
+    rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    yolo_resized = cv2.resize(rgb, (YOLO_W, YOLO_H), interpolation=cv2.INTER_LINEAR)
+    yolo_norm = (yolo_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+    yolo_chw = yolo_norm.transpose(2, 0, 1)
+    return np.expand_dims(yolo_chw, axis=0), orig_shape
+
+
+def preprocess_depth(
+    bgr_frame: np.ndarray,
+    depth_size: tuple[int, int] | None = None,
+) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    if depth_size is None:
+        depth_w, depth_h = DEPTH_W, DEPTH_H
+    else:
+        depth_w, depth_h = depth_size
+    depth_resized = cv2.resize(rgb, (depth_w, depth_h), interpolation=cv2.INTER_LINEAR)
+    depth_norm = (depth_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
+    depth_chw = depth_norm.transpose(2, 0, 1)
+    return np.expand_dims(depth_chw, axis=0)
+
+
 def preprocess(
     bgr_frame: np.ndarray,
     depth_size: tuple[int, int] | None = None,
@@ -33,23 +59,6 @@ def preprocess(
     """
     orig_shape = bgr_frame.shape[:2]
 
-    # Convert BGR → RGB
-    rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-
-    # Resize for YOLO (640x640)
-    yolo_resized = cv2.resize(rgb, (YOLO_W, YOLO_H), interpolation=cv2.INTER_LINEAR)
-    yolo_norm = (yolo_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
-    yolo_chw = yolo_norm.transpose(2, 0, 1)
-    yolo_tensor = np.expand_dims(yolo_chw, axis=0)
-
-    # Resize for Depth (default 392x630)
-    if depth_size is None:
-        depth_w, depth_h = DEPTH_W, DEPTH_H
-    else:
-        depth_w, depth_h = depth_size
-    depth_resized = cv2.resize(rgb, (depth_w, depth_h), interpolation=cv2.INTER_LINEAR)
-    depth_norm = (depth_resized.astype(np.float32) / 255.0 - _MEAN) / _STD
-    depth_chw = depth_norm.transpose(2, 0, 1)
-    depth_tensor = np.expand_dims(depth_chw, axis=0)
-
+    yolo_tensor, orig_shape = preprocess_yolo(bgr_frame)
+    depth_tensor = preprocess_depth(bgr_frame, depth_size=depth_size)
     return yolo_tensor, depth_tensor, orig_shape

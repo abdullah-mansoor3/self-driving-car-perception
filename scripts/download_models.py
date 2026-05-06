@@ -142,7 +142,7 @@ def download_depth_anything():
     )
     tmp_script = ROOT / "_export_depth_tmp.py"
     tmp_script.write_text(export_code)
-    run(f"python {tmp_script}")
+    run(f'python "{tmp_script}"')
     tmp_script.unlink()
     print(f"[OK] Depth ONNX saved to {onnx_path}")
 
@@ -165,7 +165,7 @@ def quantize(model_name: str):
         return
     tmp = ROOT / "_quant_tmp.py"
     tmp.write_text(QUANT_SCRIPT.format(src=src, dst=dst))
-    run(f"python {tmp}")
+    run(f'python "{tmp}"')
     tmp.unlink()
 
 

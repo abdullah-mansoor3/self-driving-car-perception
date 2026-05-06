@@ -24,9 +24,10 @@ import tempfile
 import time
 import cv2
 from tqdm import tqdm
+from pathlib import Path
 
 from src.pipeline import (
-    YOLOPv2, DepthEstimator, preprocess,
+    YOLOPv2, DepthEstimator, preprocess_yolo, preprocess_depth,
     Fuser, Navigator, TTSEngine, draw,
 )
 from src.pipeline.navigation import Severity
@@ -34,6 +35,13 @@ from src.pipeline.navigation import Severity
 # ── Model paths ────────────────────────────────────────────────────────────────
 YOLO_ONNX  = "models/yolopv2_int8.onnx"
 DEPTH_ONNX = "models/depth_anything_v2_small_int8.onnx"
+
+
+def _fallback_model_path(preferred: str) -> str | None:
+    if preferred.endswith("_int8.onnx"):
+        fp32 = preferred.replace("_int8.onnx", ".onnx")
+        return fp32 if Path(fp32).exists() else None
+    return None
 
 
 def parse_args():
@@ -47,6 +55,8 @@ def parse_args():
     p.add_argument("--depth-size", default=None,
                    help="Depth input size WxH (requires re-exported depth ONNX), e.g. 560x336")
     p.add_argument("--width",    type=int, default=1280, help="Display window width")
+    p.add_argument("--profile",  action="store_true",
+                   help="Print periodic per-stage timing stats")
     return p.parse_args()
 
 
@@ -113,10 +123,13 @@ def _process_video(
     progress,
     tts_min_gap_s=1.2,
     depth_size=None,
+    profile=False,
 ):
     fps_buf = []
     frame_idx = 0
     last_tts_frame = -1_000_000
+    t_acc = {"prep": 0.0, "yolo": 0.0, "depthprep": 0.0, "fuse": 0.0, "draw": 0.0, "total": 0.0}
+    t_count = 0
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     pbar = None
@@ -135,14 +148,30 @@ def _process_video(
 
         frame_idx += 1
 
-        yolo_tensor, depth_tensor, orig_shape = preprocess(frame, depth_size=depth_size)
-        boxes, da_mask, lane_mask = detector.infer(yolo_tensor, orig_shape)
+        t1 = time.perf_counter()
+        yolo_tensor, orig_shape = preprocess_yolo(frame)
+        t_acc["prep"] += time.perf_counter() - t1
 
-        depth.update(depth_tensor)
+        depth_tensor = None
+        if depth.should_infer_next():
+            td = time.perf_counter()
+            depth_tensor = preprocess_depth(frame, depth_size=depth_size)
+            t_acc["depthprep"] += time.perf_counter() - td
+
+        t2 = time.perf_counter()
+        boxes, da_mask, lane_mask = detector.infer(yolo_tensor, orig_shape)
+        t_acc["yolo"] += time.perf_counter() - t2
+
+        if depth_tensor is not None:
+            depth.update(depth_tensor)
+        else:
+            depth.mark_frame_processed()
         depth_map = depth.get_depth_map()
 
+        t3 = time.perf_counter()
         state = fuser.fuse(boxes, da_mask, lane_mask, depth.get_depth_at_box)
         event = nav.process(state)
+        t_acc["fuse"] += time.perf_counter() - t3
 
         if tts and event:
             priority = (event.severity == Severity.CRITICAL)
@@ -151,9 +180,13 @@ def _process_video(
                 tts.speak(event.instruction, priority=priority)
                 last_tts_frame = frame_idx
 
+        t4 = time.perf_counter()
         vis = draw(frame, da_mask, lane_mask, depth_map, state, event)
+        t_acc["draw"] += time.perf_counter() - t4
 
         elapsed = time.perf_counter() - t0
+        t_acc["total"] += elapsed
+        t_count += 1
         fps_buf.append(1.0 / max(elapsed, 1e-6))
         if len(fps_buf) > 30:
             fps_buf.pop(0)
@@ -172,6 +205,17 @@ def _process_video(
         if pbar is not None:
             pbar.update(1)
 
+        if profile and t_count % 120 == 0:
+            denom = float(t_count)
+            print(
+                f"[profile] avg ms: total={1000*t_acc['total']/denom:.1f} "
+                f"prep={1000*t_acc['prep']/denom:.1f} "
+                f"yolo={1000*t_acc['yolo']/denom:.1f} "
+                f"depthprep={1000*t_acc['depthprep']/denom:.1f} "
+                f"fuse={1000*t_acc['fuse']/denom:.1f} "
+                f"draw={1000*t_acc['draw']/denom:.1f}"
+            )
+
     if show:
         cv2.destroyWindow("Self-Driving Perception")
     if pbar is not None:
@@ -189,8 +233,25 @@ def main():
 
     # ── Load models ──────────────────────────────────────────────────────────
     print("\nLoading models…")
-    detector = YOLOPv2(YOLO_ONNX, conf_thresh=args.conf)
-    depth    = DepthEstimator(DEPTH_ONNX, skip_frames=args.depth_skip)
+    try:
+        detector = YOLOPv2(YOLO_ONNX, conf_thresh=args.conf)
+    except Exception as e:
+        fallback = _fallback_model_path(YOLO_ONNX)
+        if not fallback:
+            raise
+        print(f"[WARN] Failed to load {YOLO_ONNX}: {e}")
+        print(f"[WARN] Falling back to {fallback}")
+        detector = YOLOPv2(fallback, conf_thresh=args.conf)
+
+    try:
+        depth = DepthEstimator(DEPTH_ONNX, skip_frames=args.depth_skip)
+    except Exception as e:
+        fallback = _fallback_model_path(DEPTH_ONNX)
+        if not fallback:
+            raise
+        print(f"[WARN] Failed to load {DEPTH_ONNX}: {e}")
+        print(f"[WARN] Falling back to {fallback}")
+        depth = DepthEstimator(fallback, skip_frames=args.depth_skip)
     fuser    = Fuser()
     nav      = Navigator(cooldown_s=2.5)
     tts      = TTSEngine() if not args.no_tts else None
@@ -231,6 +292,7 @@ def main():
             fps,
             True,
             depth_size=depth_size,
+            profile=args.profile,
         )
 
         cap.release()
@@ -257,6 +319,7 @@ def main():
             fps,
             False,
             depth_size=depth_size,
+            profile=args.profile,
         )
         cap.release()
         print("\nDemo ended.")

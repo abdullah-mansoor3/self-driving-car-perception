@@ -12,6 +12,7 @@ Outputs three things per forward pass:
 import numpy as np
 import onnxruntime as ort
 import cv2
+import os
 
 # Class labels as defined in BDD100K (YOLOPv2 training set)
 LABELS = [
@@ -109,13 +110,24 @@ def _non_max_suppression(prediction: np.ndarray, conf_thres: float, iou_thres: f
 class YOLOPv2:
     def __init__(self, onnx_path: str, conf_thresh: float = 0.45, iou_thresh: float = 0.5):
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 4          # use 4 of your i5 cores
+        opts.intra_op_num_threads = min(8, max(1, (os.cpu_count() or 4) - 1))
+        opts.inter_op_num_threads = 1
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        self.session     = ort.InferenceSession(onnx_path, sess_options=opts,
-                                                providers=["CPUExecutionProvider"])
+        providers = ort.get_available_providers()
+        provider_chain = []
+        if "CUDAExecutionProvider" in providers:
+            provider_chain.append("CUDAExecutionProvider")
+        provider_chain.append("CPUExecutionProvider")
+        self.session = ort.InferenceSession(
+            onnx_path,
+            sess_options=opts,
+            providers=provider_chain,
+        )
         self.conf_thresh = conf_thresh
         self.iou_thresh  = iou_thresh
+        self._grid_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._anchor_cache: list[np.ndarray] | None = None
 
         # Grab input/output names from the ONNX graph
         self.input_name  = self.session.get_inputs()[0].name
@@ -148,8 +160,26 @@ class YOLOPv2:
             self.ll_name = output_names[-1]
 
         print(f"[YOLOPv2] Loaded from {onnx_path}")
+        print(f"          Providers: {self.session.get_providers()}")
         print(f"          Input:   {self.input_name}")
         print(f"          Outputs: {output_names}")
+
+    def _decode_with_cache(self, pred_layers: list[np.ndarray], anchor_grid: list[np.ndarray]) -> np.ndarray:
+        z = []
+        strides = [8, 16, 32]
+        for i in range(3):
+            pred = pred_layers[i]
+            bs, _, ny, nx = pred.shape
+            pred = pred.reshape(bs, 3, 85, ny, nx).transpose(0, 1, 3, 4, 2)
+            y = _sigmoid(pred)
+            key = (ny, nx)
+            if key not in self._grid_cache:
+                self._grid_cache[key] = _make_grid(nx, ny)
+            grid = self._grid_cache[key]
+            y[..., 0:2] = (y[..., 0:2] * 2.0 - 0.5 + grid) * strides[i]
+            y[..., 2:4] = (y[..., 2:4] * 2.0) ** 2 * anchor_grid[i]
+            z.append(y.reshape(bs, -1, 85))
+        return np.concatenate(z, axis=1)
 
     def infer(
         self,
@@ -161,10 +191,18 @@ class YOLOPv2:
         orig_h, orig_w         = orig_shape
 
         # ── Forward pass ──────────────────────────────────────────────────
-        det_raw, a0, a1, a2, da_raw, ll_raw = self.session.run(
-            [self.det_name, *self.anchor_names[:3], self.da_name, self.ll_name],
-            {self.input_name: tensor},
-        )
+        if self._anchor_cache is None:
+            det_raw, a0, a1, a2, da_raw, ll_raw = self.session.run(
+                [self.det_name, *self.anchor_names[:3], self.da_name, self.ll_name],
+                {self.input_name: tensor},
+            )
+            self._anchor_cache = [a0, a1, a2]
+        else:
+            det_raw, da_raw, ll_raw = self.session.run(
+                [self.det_name, self.da_name, self.ll_name],
+                {self.input_name: tensor},
+            )
+            a0, a1, a2 = self._anchor_cache
         # det_raw: list of 3 tensors (1, 255, ny, nx)
         # a0/a1/a2: anchor grids
         # da_raw: (1, 2, H, W)
@@ -179,7 +217,7 @@ class YOLOPv2:
         lane_mask = cv2.resize(lane_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
         # ── Detection post-processing ──────────────────────────────────────
-        pred = _decode_yolop(det_raw, [a0, a1, a2])
+        pred = self._decode_with_cache(det_raw, [a0, a1, a2])
         nms_out = _non_max_suppression(pred, self.conf_thresh, self.iou_thresh)
         dets = nms_out[0] if len(nms_out) else np.zeros((0, 6), dtype=np.float32)
 

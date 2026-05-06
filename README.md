@@ -88,9 +88,43 @@ python demo.py --source 0 --save output.avi
 
 # Silent mode (no TTS)
 python demo.py --source 0 --no-tts
+
+# Print stage timings every ~120 frames
+python demo.py --source data/samples/dashcam.mp4 --profile
 ```
 
 Press `q` in the window to quit.
+
+## GPU/CPU execution policy
+
+The pipeline now tries ONNX Runtime `CUDAExecutionProvider` first, and falls back
+to `CPUExecutionProvider` automatically if CUDA is unavailable.
+
+CPU fallback is optimized with:
+- `ORT_ENABLE_ALL` graph optimizations
+- tuned thread counts for detector/depth sessions
+- reduced per-frame preprocessing work (depth input is only built when needed)
+- cached YOLO decode grids + cached anchor outputs
+
+## CARLA preprocessing (Kaggle archive -> training subset)
+
+`notebooks/01_generate_carla_data.ipynb` is optional if you already have CARLA data.
+Use this script to build a compact, balanced synthetic dataset with `domain=0`:
+
+```bash
+python scripts/preprocess_carla_dataset.py \
+  --archive /data/archive \
+  --target-samples 2400 \
+  --model models/yolopv2_int8.onnx
+```
+
+This writes:
+- `data/carla/images/*.jpg`
+- `data/carla/labels/*.txt`
+- `data/carla/masks/*.png`
+- `data/carla/manifest.csv`
+
+The manifest is directly compatible with `notebooks/03_finetune_yolopv2.ipynb`.
 
 ---
 
