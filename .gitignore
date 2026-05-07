@@ -8,6 +8,7 @@ _quant_tmp.py
 test_footage/
 _depth_anything_repo/
 data/
+.agents/
 
 # Python
 __pycache__/

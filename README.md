@@ -1,7 +1,7 @@
 # Self-Driving Car Perception — CV Project
 
 Multi-task real-time driving perception pipeline using YOLOPv2 (lane + drivable area
-+ object detection) and Depth Anything V2 Small (monocular depth), with voice
++ object detection) and MiDaS Small (monocular depth), with voice
 instructions via Kokoro TTS.
 
 ---
@@ -18,14 +18,16 @@ sdcar-perception/
 │   └── pipeline/
 │       ├── preprocessor.py        ← resize + normalize frames
 │       ├── detector.py            ← YOLOPv2 ONNX wrapper
-│       ├── depth_estimator.py     ← Depth Anything V2 + background thread
+│       ├── depth_estimator.py     ← MiDaS Small + background thread
 │       ├── fusion.py              ← combines outputs into SceneState
 │       ├── navigation.py          ← rule engine + roast generator
 │       ├── tts_engine.py          ← Kokoro TTS, non-blocking queue
 │       └── visualizer.py          ← draws overlays onto the frame
 ├── models/                        ← ONNX weights land here (gitignored)
 └── data/
-    └── samples/                   ← put test videos here
+    ├── carla/images/              ← CARLA frames
+    ├── real/videos/               ← real dashcam videos
+    └── yolopv2_finetune/          ← generated mixed-domain training set
 ```
 
 ---
@@ -59,18 +61,18 @@ python scripts/download_models.py
 | Step | Action |
 |---|---|
 | 1 | Downloads YOLOPv2 as a **pre-exported ONNX** directly from GitHub releases — no `.pt` file, no PyTorch export needed |
-| 2 | Downloads Depth Anything V2 Small `.pth` checkpoint from HuggingFace and exports it to ONNX using the legacy `torch.onnx` exporter |
+| 2 | Downloads a MiDaS v2.1 Small ONNX export from Hugging Face |
 | 3 | INT8-quantizes both ONNX models (~30% speed gain on CPU) |
 
 > **Note — why not the official YOLOPv2 `.pt` weights?**
 > The CAIC-AD Google Drive link in the official repo is dead (returns 404).
 > We use a community ONNX export (Kazuhito00, MIT licence) instead.
-> Input size for this ONNX is **640×640** (square).
+> Finetuned exports and the runtime preprocessor use **320×320** YOLOPv2 input.
 
-> **Note — why 392×630 for Depth Anything V2?**
-> The DINOv2 backbone divides the image into 14×14 patches, so both height and
-> width must be exact multiples of 14. The commonly suggested 384×640 is not
-> (`384 / 14 = 27.4`). The closest valid size is `392×630` (28×14 and 45×14).
+> **Note — why MiDaS Small?**
+> MiDaS Small uses a compact CNN-style model at **256×256** input. It is less
+> detailed than larger ViT depth models, but it is much faster on CPU and is
+> enough for rough proximity estimates in the navigation logic.
 
 ---
 
@@ -109,7 +111,7 @@ CPU fallback is optimized with:
 ## CARLA preprocessing (Kaggle archive -> training subset)
 
 `notebooks/01_generate_carla_data.ipynb` is optional if you already have CARLA data.
-Use this script to build a compact, balanced synthetic dataset with `domain=0`:
+Use this script to build a compact synthetic image set:
 
 ```bash
 python scripts/preprocess_carla_dataset.py \
@@ -118,13 +120,16 @@ python scripts/preprocess_carla_dataset.py \
   --model models/yolopv2_int8.onnx
 ```
 
-This writes:
-- `data/carla/images/*.jpg`
-- `data/carla/labels/*.txt`
-- `data/carla/masks/*.png`
-- `data/carla/manifest.csv`
+Then run `notebooks/02_generate_pseudo_labels.ipynb` on Colab. It uses separate
+teacher models instead of YOLOPv2 itself:
 
-The manifest is directly compatible with `notebooks/03_finetune_yolopv2.ipynb`.
+- YOLOv8x for driving-object boxes
+- UFLD-v2 for lane masks
+- SegFormer-B2 Cityscapes for drivable road masks
+
+It samples the real videos to about 5000 total frames, resizes final images and
+masks to `320×320`, records whether each frame is `real` or `simulated`, and
+writes the mixed dataset to `data/yolopv2_finetune/manifest.csv`.
 
 ---
 
@@ -146,8 +151,8 @@ The manifest is directly compatible with `notebooks/03_finetune_yolopv2.ipynb`.
 
 | Component | Input size | Per-frame cost |
 |---|---|---|
-| YOLOPv2 INT8 | 640×640 | ~90–120 ms |
-| Depth Anything V2 Small (every 3rd frame, amortized) | 392×630 | ~50 ms |
+| YOLOPv2 INT8 | 320×320 | depends on CPU/GPU provider |
+| MiDaS Small INT8 (every 6th frame by default, amortized) | 256×256 | ~30–40 ms CPU before amortization |
 | Fusion + navigation | — | ~3 ms |
 | **Total** | | **~100–130 ms → 7–10 FPS** |
 
@@ -156,15 +161,6 @@ TTS runs in a background thread — zero impact on frame rate.
 ---
 
 ## Troubleshooting
-
-**`AssertionError: Input image height X is not a multiple of patch height 14`**
-The depth model input dimensions must each be divisible by 14. If you re-export
-with a custom size, make sure both H and W satisfy `dim % 14 == 0`.
-
-**`torch.onnx export fails with torch.export error`**
-Add `dynamo=False` to your `torch.onnx.export()` call. PyTorch 2.x defaults to
-the new `torch.export`-based exporter which fails on dynamic ViT ops in
-Depth Anything V2.
 
 **YOLOPv2 download fails (404)**
 The `wget` URL points to a GitHub release asset. If it becomes unavailable,

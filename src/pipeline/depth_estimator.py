@@ -1,7 +1,7 @@
 """
 src/pipeline/depth_estimator.py
 ────────────────────────────────
-Depth Anything V2 Small — ONNX wrapper.
+MiDaS Small — ONNX wrapper.
 
 Runs in a background thread every N frames (default 3) and exposes
 a cached depth map so the main pipeline never blocks waiting for it.

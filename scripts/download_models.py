@@ -7,8 +7,7 @@ Run once before starting the live demo:
 What this does:
   1. Downloads YOLOPv2 as a pre-exported ONNX directly from GitHub releases
      (no .pt weights, no PyTorch export step needed)
-  2. Downloads Depth Anything V2 Small checkpoint from HuggingFace and
-     exports it to ONNX using the legacy torch.onnx exporter
+  2. Downloads MiDaS Small ONNX from a Hugging Face ONNX export
   3. INT8-quantizes both ONNX models for faster CPU inference
 
 All final files land in models/.
@@ -35,8 +34,12 @@ def run(cmd: str):
         sys.exit(1)
 
 
-def already_exists(path: Path, label: str) -> bool:
+def already_exists(path: Path, label: str, min_bytes: int = 1) -> bool:
     if path.exists():
+        if path.stat().st_size < min_bytes:
+            print(f"[WARN] {label} at {path} looks incomplete; re-downloading")
+            path.unlink()
+            return False
         print(f"[SKIP] {label} already exists at {path}")
         return True
     return False
@@ -48,7 +51,8 @@ def already_exists(path: Path, label: str) -> bool:
 # The official CAIC-AD Google Drive link is dead.
 # We download the pre-exported ONNX directly from the Kazuhito00 community
 # inference repo (MIT licence), which ships the ONNX in its GitHub releases.
-# Input size for this export: 640x640 (square).
+# The community export has dynamic H/W axes; the runtime preprocessor feeds
+# 320x320 and the finetune notebook exports the final model at 320x320.
 # ─────────────────────────────────────────────────────────────────────────────
 
 YOLOPV2_ONNX_URL = (
@@ -68,83 +72,27 @@ def download_yolopv2():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2 — Depth Anything V2 Small
+# Step 2 — MiDaS Small
 #
-# DINOv2 patch embeddings require H and W to be exact multiples of 14.
-#   384 / 14 = 27.43  <- crashes
-#   392 / 14 = 28.00  <- OK
-#   640 / 14 = 45.71  <- crashes
-#   630 / 14 = 45.00  <- OK
-#
-# Export uses dynamo=False to force the legacy torch.onnx exporter.
-# PyTorch 2.x defaults to torch.export which fails on dynamic ViT ops.
+# The official MiDaS v2.1 GitHub release provides the small model as .pt and
+# OpenVINO, but not this ONNX asset. Use a public ONNX export of the same
+# midas_v21_small_256 model. Input size is 256x256 RGB.
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPTH_EXPORT_SCRIPT = """
-import torch
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path("{repo}").resolve()))
-from depth_anything_v2.dpt import DepthAnythingV2
-
-model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384])
-ckpt  = torch.load("{ckpt}", map_location="cpu")
-model.load_state_dict(ckpt)
-model.eval()
-
-# 392 = 28x14,  630 = 45x14  -- both divisible by DINOv2 patch size (14)
-dummy = torch.zeros(1, 3, 392, 630)
-
-torch.onnx.export(
-    model,
-    dummy,
-    "{out}",
-    input_names=["image"],
-    output_names=["depth"],
-    opset_version=16,
-    dynamo=False,             # legacy exporter -- avoids torch.export failures
-    do_constant_folding=True,
+MIDAS_SMALL_ONNX_URL = (
+    "https://huggingface.co/julienkay/sentis-MiDaS/resolve/main/"
+    "onnx/midas_v21_small_256.onnx"
 )
-print("[OK] Depth Anything V2 Small ONNX exported.")
-"""
 
 
-def download_depth_anything():
-    onnx_path = MODELS_DIR / "depth_anything_v2_small.onnx"
-    if already_exists(onnx_path, "Depth Anything V2 Small ONNX"):
+def download_midas_small():
+    onnx_path = MODELS_DIR / "midas_small.onnx"
+    if already_exists(onnx_path, "MiDaS Small ONNX", min_bytes=10 * 1024 * 1024):
         return
 
-    ckpt_path = MODELS_DIR / "depth_anything_v2_vits.pth"
-    repo_dir  = ROOT / "_depth_anything_repo"
-
-    # Clone repo
-    if not repo_dir.exists():
-        run(f"git clone https://github.com/DepthAnything/Depth-Anything-V2 {repo_dir}")
-        run(f"pip install -r {repo_dir}/requirements.txt -q")
-
-    # Download checkpoint from HuggingFace
-    if not ckpt_path.exists():
-        print("\n[Depth] Downloading Depth Anything V2 Small checkpoint (~100 MB)...")
-        from huggingface_hub import hf_hub_download
-        downloaded = hf_hub_download(
-            repo_id="depth-anything/Depth-Anything-V2-Small",
-            filename="depth_anything_v2_vits.pth",
-            local_dir=str(MODELS_DIR),
-        )
-        print(f"[Depth] Checkpoint saved to {downloaded}")
-
-    # Write tmp export script and run it
-    export_code = DEPTH_EXPORT_SCRIPT.format(
-        repo=repo_dir,
-        ckpt=ckpt_path,
-        out=onnx_path,
-    )
-    tmp_script = ROOT / "_export_depth_tmp.py"
-    tmp_script.write_text(export_code)
-    run(f'python "{tmp_script}"')
-    tmp_script.unlink()
-    print(f"[OK] Depth ONNX saved to {onnx_path}")
+    print("\n[Depth] Downloading MiDaS Small ONNX (~66 MB)...")
+    run(f'wget -O "{onnx_path}" "{MIDAS_SMALL_ONNX_URL}"')
+    print(f"[OK] MiDaS Small ONNX saved to {onnx_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,14 +129,14 @@ if __name__ == "__main__":
     print("\n[1/4] YOLOPv2 -- direct ONNX download")
     download_yolopv2()
 
-    print("\n[2/4] Depth Anything V2 Small -- checkpoint + ONNX export")
-    download_depth_anything()
+    print("\n[2/4] MiDaS Small -- direct ONNX download")
+    download_midas_small()
 
     print("\n[3/4] INT8 quantization -- YOLOPv2")
     quantize("yolopv2")
 
-    print("\n[4/4] INT8 quantization -- Depth Anything V2 Small")
-    quantize("depth_anything_v2_small")
+    print("\n[4/4] INT8 quantization -- MiDaS Small")
+    quantize("midas_small")
 
     print("\n" + "=" * 60)
     print("  All models ready. Run:  python demo.py --source 0")

@@ -12,8 +12,8 @@ import numpy as np
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-YOLO_W, YOLO_H   = 640, 640   # YOLOPv2 fixed input (Kazuhito00 ONNX export)
-DEPTH_W, DEPTH_H = 630, 392   # Depth Anything V2 Small (both divisible by 14)
+YOLO_W, YOLO_H   = 320, 320   # fine-tuned YOLOPv2 export target
+DEPTH_W, DEPTH_H = 256, 256   # MiDaS Small ONNX input
 
 
 def preprocess_yolo(
@@ -53,8 +53,8 @@ def preprocess(
 
     Returns
     -------
-    yolo_tensor  : (1, 3, 640, 640) float32 — feed to YOLOPv2
-    depth_tensor : (1, 3, H, W) float32 — feed to Depth Anything
+    yolo_tensor  : (1, 3, 320, 320) float32 — feed to YOLOPv2
+    depth_tensor : (1, 3, 256, 256) float32 — feed to MiDaS Small
     orig_shape   : (orig_H, orig_W) — needed to scale detections back
     """
     orig_shape = bgr_frame.shape[:2]

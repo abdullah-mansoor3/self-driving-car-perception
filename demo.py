@@ -34,7 +34,7 @@ from src.pipeline.navigation import Severity
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 YOLO_ONNX  = "models/yolopv2_int8.onnx"
-DEPTH_ONNX = "models/depth_anything_v2_small_int8.onnx"
+DEPTH_ONNX = "models/midas_small_int8.onnx"
 
 
 def _fallback_model_path(preferred: str) -> str | None:
@@ -228,8 +228,6 @@ def main():
     depth_size = None
     if args.depth_size:
         depth_size = _parse_size(args.depth_size)
-        if depth_size[0] % 14 != 0 or depth_size[1] % 14 != 0:
-            raise ValueError("Depth size must be divisible by 14 (both W and H)")
 
     # ── Load models ──────────────────────────────────────────────────────────
     print("\nLoading models…")

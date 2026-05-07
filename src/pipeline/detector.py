@@ -183,7 +183,7 @@ class YOLOPv2:
 
     def infer(
         self,
-        tensor: np.ndarray,           # (1, 3, 640, 640) float32
+        tensor: np.ndarray,           # (1, 3, 320, 320) float32
         orig_shape: tuple,            # (orig_H, orig_W)
     ) -> tuple[list[dict], np.ndarray, np.ndarray]:
 
