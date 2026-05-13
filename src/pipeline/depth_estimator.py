@@ -46,7 +46,7 @@ class DepthEstimator:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, tensor: np.ndarray):
+    def update(self, tensor: np.ndarray, orig_shape: tuple[int, int] | None = None):
         """
         Call once per frame from the main loop.
         Launches a background thread every `skip_frames` frames.
@@ -58,7 +58,7 @@ class DepthEstimator:
             if self._thread is None or not self._thread.is_alive():
                 t = threading.Thread(
                     target=self._infer,
-                    args=(tensor.copy(),),   # copy so the main loop can reuse the array
+                    args=(tensor.copy(), orig_shape),   # copy so the main loop can reuse the array
                     daemon=True,
                 )
                 t.start()
@@ -83,6 +83,11 @@ class DepthEstimator:
         with self._lock:
             return self._depth_map.copy() if self._depth_map is not None else None
 
+    def wait(self, timeout: float | None = None):
+        """Wait for any in-flight background depth inference to finish."""
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
     def get_depth_at_box(self, x1: int, y1: int, x2: int, y2: int) -> float | None:
         """
         Returns the median depth in the bottom 30% of a bounding box.
@@ -98,6 +103,15 @@ class DepthEstimator:
 
         h_box = y2 - y1
         y_contact = y2 - max(1, int(h_box * 0.30))   # bottom 30% start
+        h, w = depth.shape
+        x1 = min(max(int(x1), 0), w - 1)
+        x2 = min(max(int(x2), 0), w)
+        y_contact = min(max(int(y_contact), 0), h - 1)
+        y2 = min(max(int(y2), 0), h)
+
+        if x2 <= x1 or y2 <= y_contact:
+            return None
+
         region = depth[y_contact:y2, x1:x2]
 
         if region.size == 0:
@@ -106,7 +120,7 @@ class DepthEstimator:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _infer(self, tensor: np.ndarray):
+    def _infer(self, tensor: np.ndarray, orig_shape: tuple[int, int] | None):
         _, _, model_h, model_w = tensor.shape
         raw = self.session.run([self.output_name], {self.input_name: tensor})[0]
         # raw: (1, H, W) or (H, W) depending on export
@@ -116,6 +130,10 @@ class DepthEstimator:
         d_min, d_max = depth.min(), depth.max()
         if d_max - d_min > 1e-6:
             depth = (depth - d_min) / (d_max - d_min)
+
+        if orig_shape is not None:
+            orig_h, orig_w = orig_shape
+            depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
         with self._lock:
             self._depth_map = depth.astype(np.float32)
