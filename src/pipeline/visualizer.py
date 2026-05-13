@@ -43,6 +43,11 @@ def draw(
         lane_color[lane_mask == 1] = COLOR_LANE
         out = cv2.addWeighted(out, 1.0, lane_color, 0.6, 0)
 
+    for lane_line in state.lane_lines:
+        if len(lane_line) >= 2:
+            pts = np.array(lane_line, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pts], False, COLOR_LANE, 4, cv2.LINE_AA)
+
     # ── Depth map thumbnail (top-right corner) ────────────────────────────
     if depth_map is not None:
         h, w = out.shape[:2]

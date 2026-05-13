@@ -28,12 +28,12 @@ from pathlib import Path
 
 from src.pipeline import (
     YOLOPv2, DepthEstimator, preprocess_yolo, preprocess_depth,
-    Fuser, Navigator, TTSEngine, draw,
+    LanePostProcessor, Fuser, Navigator, TTSEngine, draw,
 )
 from src.pipeline.navigation import Severity
 
 # ── Model paths ────────────────────────────────────────────────────────────────
-YOLO_ONNX  = "models/yolopv2_int8.onnx"
+YOLO_ONNX  = "models/yolop_finetuned_int8.onnx"
 DEPTH_ONNX = "models/midas_small_int8.onnx"
 
 
@@ -50,10 +50,24 @@ def parse_args():
     p.add_argument("--save",     default=None, help="Path to save output video (optional)")
     p.add_argument("--no-tts",   action="store_true", help="Disable voice output")
     p.add_argument("--conf",     type=float, default=0.6, help="Detection confidence threshold")
+    p.add_argument("--yolo-model", default=YOLO_ONNX,
+                   help="YOLOPv2 ONNX path. Use models/yolopv2_int8.onnx for faster CPU mode.")
+    p.add_argument("--yolo-size", default=None,
+                   help="YOLO input size WxH for dynamic ONNX models, e.g. 320x320")
+    p.add_argument("--yolo-skip", type=int, default=1,
+                   help="Run YOLO/lane/drivable inference every N frames and reuse the last result")
     p.add_argument("--depth-skip", type=int, default=6,
                    help="Run depth inference every N frames (higher = faster)")
     p.add_argument("--depth-size", default=None,
                    help="Depth input size WxH (requires re-exported depth ONNX), e.g. 560x336")
+    p.add_argument("--max-obstacle-depth", type=float, default=1.0,
+                   help="Ignore detected obstacles farther than this normalized depth (0=near, 1=far)")
+    p.add_argument("--drop-unknown-depth", action="store_true",
+                   help="Ignore obstacles until a depth value is available for their box")
+    p.add_argument("--lane-history", type=int, default=10,
+                   help="Number of recent lane masks to combine for dashed-lane stability")
+    p.add_argument("--lane-votes", type=int, default=2,
+                   help="Minimum mask votes needed to keep a lane pixel after smoothing")
     p.add_argument("--width",    type=int, default=1280, help="Display window width")
     p.add_argument("--profile",  action="store_true",
                    help="Print periodic per-stage timing stats")
@@ -113,6 +127,7 @@ def _process_video(
     cap,
     detector,
     depth,
+    lane_post,
     fuser,
     nav,
     tts,
@@ -122,12 +137,15 @@ def _process_video(
     fps,
     progress,
     tts_min_gap_s=1.2,
+    yolo_skip=1,
     depth_size=None,
     profile=False,
 ):
     fps_buf = []
     frame_idx = 0
     last_tts_frame = -1_000_000
+    yolo_skip = max(1, int(yolo_skip))
+    last_perception = None
     t_acc = {"prep": 0.0, "yolo": 0.0, "depthprep": 0.0, "fuse": 0.0, "draw": 0.0, "total": 0.0}
     t_count = 0
 
@@ -148,22 +166,28 @@ def _process_video(
 
         frame_idx += 1
 
-        t1 = time.perf_counter()
-        yolo_tensor, orig_shape = preprocess_yolo(frame)
-        t_acc["prep"] += time.perf_counter() - t1
-
         depth_tensor = None
         if depth.should_infer_next():
             td = time.perf_counter()
             depth_tensor = preprocess_depth(frame, depth_size=depth_size)
             t_acc["depthprep"] += time.perf_counter() - td
 
-        t2 = time.perf_counter()
-        boxes, da_mask, lane_mask = detector.infer(yolo_tensor, orig_shape)
-        t_acc["yolo"] += time.perf_counter() - t2
+        should_run_yolo = last_perception is None or (frame_idx - 1) % yolo_skip == 0
+        if should_run_yolo:
+            t1 = time.perf_counter()
+            yolo_tensor, orig_shape = preprocess_yolo(frame, input_size=detector.input_size)
+            t_acc["prep"] += time.perf_counter() - t1
+
+            t2 = time.perf_counter()
+            boxes, da_mask, lane_mask = detector.infer(yolo_tensor, orig_shape)
+            lane_mask = lane_post.update(lane_mask)
+            t_acc["yolo"] += time.perf_counter() - t2
+            last_perception = (boxes, da_mask, lane_mask)
+        else:
+            boxes, da_mask, lane_mask = last_perception
 
         if depth_tensor is not None:
-            depth.update(depth_tensor)
+            depth.update(depth_tensor, orig_shape=frame.shape[:2])
         else:
             depth.mark_frame_processed()
         depth_map = depth.get_depth_map()
@@ -218,6 +242,7 @@ def _process_video(
 
     if show:
         cv2.destroyWindow("Self-Driving Perception")
+    depth.wait()
     if pbar is not None:
         pbar.close()
 
@@ -228,18 +253,19 @@ def main():
     depth_size = None
     if args.depth_size:
         depth_size = _parse_size(args.depth_size)
+    yolo_size = _parse_size(args.yolo_size) if args.yolo_size else None
 
     # ── Load models ──────────────────────────────────────────────────────────
     print("\nLoading models…")
     try:
-        detector = YOLOPv2(YOLO_ONNX, conf_thresh=args.conf)
+        detector = YOLOPv2(args.yolo_model, conf_thresh=args.conf, input_size=yolo_size)
     except Exception as e:
-        fallback = _fallback_model_path(YOLO_ONNX)
+        fallback = _fallback_model_path(args.yolo_model)
         if not fallback:
             raise
-        print(f"[WARN] Failed to load {YOLO_ONNX}: {e}")
+        print(f"[WARN] Failed to load {args.yolo_model}: {e}")
         print(f"[WARN] Falling back to {fallback}")
-        detector = YOLOPv2(fallback, conf_thresh=args.conf)
+        detector = YOLOPv2(fallback, conf_thresh=args.conf, input_size=yolo_size)
 
     try:
         depth = DepthEstimator(DEPTH_ONNX, skip_frames=args.depth_skip)
@@ -250,7 +276,12 @@ def main():
         print(f"[WARN] Failed to load {DEPTH_ONNX}: {e}")
         print(f"[WARN] Falling back to {fallback}")
         depth = DepthEstimator(fallback, skip_frames=args.depth_skip)
-    fuser    = Fuser()
+    max_obstacle_depth = min(max(args.max_obstacle_depth, 0.0), 1.0)
+    fuser    = Fuser(
+        max_obstacle_depth=max_obstacle_depth,
+        keep_unknown_depth=not args.drop_unknown_depth,
+    )
+    lane_post = LanePostProcessor(history=args.lane_history, min_votes=args.lane_votes)
     nav      = Navigator(cooldown_s=2.5)
     tts      = TTSEngine() if not args.no_tts else None
 
@@ -281,6 +312,7 @@ def main():
             cap,
             detector,
             depth,
+            lane_post,
             fuser,
             nav,
             tts,
@@ -289,6 +321,7 @@ def main():
             args.width,
             fps,
             True,
+            yolo_skip=args.yolo_skip,
             depth_size=depth_size,
             profile=args.profile,
         )
@@ -308,6 +341,7 @@ def main():
             cap,
             detector,
             depth,
+            lane_post,
             fuser,
             nav,
             tts,
@@ -316,6 +350,7 @@ def main():
             args.width,
             fps,
             False,
+            yolo_skip=args.yolo_skip,
             depth_size=depth_size,
             profile=args.profile,
         )

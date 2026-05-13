@@ -108,7 +108,13 @@ def _non_max_suppression(prediction: np.ndarray, conf_thres: float, iou_thres: f
 
 
 class YOLOPv2:
-    def __init__(self, onnx_path: str, conf_thresh: float = 0.45, iou_thresh: float = 0.5):
+    def __init__(
+        self,
+        onnx_path: str,
+        conf_thresh: float = 0.45,
+        iou_thresh: float = 0.5,
+        input_size: tuple[int, int] | None = None,
+    ):
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = min(8, max(1, (os.cpu_count() or 4) - 1))
         opts.inter_op_num_threads = 1
@@ -130,24 +136,36 @@ class YOLOPv2:
         self._anchor_cache: list[np.ndarray] | None = None
 
         # Grab input/output names from the ONNX graph
-        self.input_name  = self.session.get_inputs()[0].name
+        model_input      = self.session.get_inputs()[0]
+        self.input_name  = model_input.name
+        self.input_size  = input_size or self._parse_input_size(model_input.shape)
         outputs          = self.session.get_outputs()
         output_names     = [o.name for o in outputs]
 
         self.det_name    = None
         self.anchor_names = []
+        seg_names = []
         self.da_name     = None
         self.ll_name     = None
+        self.det_is_decoded = False
 
         for o in outputs:
-            if o.type.startswith("seq"):
+            if len(o.shape) == 3 and o.shape[-1] == 6:
+                self.det_name = o.name
+                self.det_is_decoded = True
+            elif o.type.startswith("seq"):
                 self.det_name = o.name
             elif len(o.shape) == 5 and o.shape[-1] == 2:
                 self.anchor_names.append(o.name)
-            elif len(o.shape) == 4 and o.shape[1] == 2:
-                self.da_name = o.name
-            elif len(o.shape) == 4 and o.shape[1] == 1:
-                self.ll_name = o.name
+            elif len(o.shape) == 4 and o.shape[1] in (1, 2):
+                seg_names.append(o.name)
+
+        if len(seg_names) >= 2:
+            self.da_name = seg_names[-2]
+            self.ll_name = seg_names[-1]
+        elif len(seg_names) == 1:
+            self.da_name = seg_names[0]
+            self.ll_name = seg_names[0]
 
         # Fallbacks for unexpected export ordering
         if self.det_name is None and output_names:
@@ -161,8 +179,18 @@ class YOLOPv2:
 
         print(f"[YOLOPv2] Loaded from {onnx_path}")
         print(f"          Providers: {self.session.get_providers()}")
-        print(f"          Input:   {self.input_name}")
+        print(f"          Input:   {self.input_name} {self.input_size[0]}x{self.input_size[1]}")
         print(f"          Outputs: {output_names}")
+
+    @staticmethod
+    def _parse_input_size(shape: list) -> tuple[int, int]:
+        if len(shape) != 4:
+            raise ValueError(
+                f"YOLOPv2 ONNX input must be NCHW, got shape {shape}"
+            )
+        if not isinstance(shape[2], int) or not isinstance(shape[3], int):
+            return 320, 320
+        return shape[3], shape[2]
 
     def _decode_with_cache(self, pred_layers: list[np.ndarray], anchor_grid: list[np.ndarray]) -> np.ndarray:
         z = []
@@ -181,17 +209,79 @@ class YOLOPv2:
             z.append(y.reshape(bs, -1, 85))
         return np.concatenate(z, axis=1)
 
+    def _postprocess_decoded_det(self, pred: np.ndarray) -> np.ndarray:
+        """Post-process exported [cx, cy, w, h, objectness, class_score/class_id]."""
+        pred = pred[0] if pred.ndim == 3 else pred
+        if pred.size == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+
+        obj = pred[:, 4]
+        cls_or_score = pred[:, 5]
+        score_like = np.nanmin(cls_or_score) >= 0.0 and np.nanmax(cls_or_score) <= 1.0
+        if score_like:
+            scores = obj * cls_or_score
+            cls_ids = np.zeros_like(scores, dtype=np.float32)
+        else:
+            scores = obj
+            cls_ids = cls_or_score.astype(np.float32)
+
+        keep = scores > self.conf_thresh
+        if not np.any(keep):
+            return np.zeros((0, 6), dtype=np.float32)
+
+        boxes = _xywh2xyxy(pred[keep, :4])
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+        keep_idx = _nms(boxes, scores, self.iou_thresh)
+        if not keep_idx:
+            return np.zeros((0, 6), dtype=np.float32)
+
+        return np.concatenate(
+            (boxes[keep_idx], scores[keep_idx, None], cls_ids[keep_idx, None]),
+            axis=1,
+        ).astype(np.float32)
+
+    @staticmethod
+    def _drivable_mask(raw: np.ndarray) -> np.ndarray:
+        raw = raw[0]
+        if raw.shape[0] == 1:
+            return (raw[0] > 0.5).astype(np.uint8)
+        return (raw[0] < 0.5).astype(np.uint8)
+
+    @staticmethod
+    def _lane_mask(raw: np.ndarray) -> np.ndarray:
+        raw = raw[0]
+        if raw.shape[0] == 1:
+            return (raw[0] > 0.5).astype(np.uint8)
+        return (raw[1] > 0.5).astype(np.uint8)
+
     def infer(
         self,
-        tensor: np.ndarray,           # (1, 3, 320, 320) float32
-        orig_shape: tuple,            # (orig_H, orig_W)
+        tensor: np.ndarray,
+        orig_shape: tuple | dict,
     ) -> tuple[list[dict], np.ndarray, np.ndarray]:
 
         _, _, model_h, model_w = tensor.shape
-        orig_h, orig_w         = orig_shape
+        if isinstance(orig_shape, dict):
+            orig_h, orig_w = orig_shape["orig_shape"]
+            scale = float(orig_shape.get("scale", 1.0))
+            pad_x, pad_y = orig_shape.get("pad", (0, 0))
+            resized_w, resized_h = orig_shape.get("resized_shape", (model_w, model_h))
+        else:
+            orig_h, orig_w = orig_shape
+            scale = min(model_w / orig_w, model_h / orig_h)
+            resized_w = max(1, int(round(orig_w * scale)))
+            resized_h = max(1, int(round(orig_h * scale)))
+            pad_x = (model_w - resized_w) // 2
+            pad_y = (model_h - resized_h) // 2
 
         # ── Forward pass ──────────────────────────────────────────────────
-        if self._anchor_cache is None:
+        if self.det_is_decoded:
+            det_raw, da_raw, ll_raw = self.session.run(
+                [self.det_name, self.da_name, self.ll_name],
+                {self.input_name: tensor},
+            )
+        elif self._anchor_cache is None:
             det_raw, a0, a1, a2, da_raw, ll_raw = self.session.run(
                 [self.det_name, *self.anchor_names[:3], self.da_name, self.ll_name],
                 {self.input_name: tensor},
@@ -209,26 +299,32 @@ class YOLOPv2:
         # ll_raw: (1, 1, H, W)
 
         # ── Segmentation masks ─────────────────────────────────────────────
-        da_mask   = (1.0 - da_raw[0][0] > 0.5).astype(np.uint8)
-        lane_mask = (ll_raw[0][0] > 0.5).astype(np.uint8)
+        da_mask   = self._drivable_mask(da_raw)
+        lane_mask = self._lane_mask(ll_raw)
 
-        # Scale masks back to original frame size
+        da_mask = da_mask[pad_y:pad_y + resized_h, pad_x:pad_x + resized_w]
+        lane_mask = lane_mask[pad_y:pad_y + resized_h, pad_x:pad_x + resized_w]
+
+        # Scale masks back to original frame size after removing letterbox padding.
         da_mask   = cv2.resize(da_mask,   (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
         lane_mask = cv2.resize(lane_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
         # ── Detection post-processing ──────────────────────────────────────
-        pred = self._decode_with_cache(det_raw, [a0, a1, a2])
-        nms_out = _non_max_suppression(pred, self.conf_thresh, self.iou_thresh)
-        dets = nms_out[0] if len(nms_out) else np.zeros((0, 6), dtype=np.float32)
+        if self.det_is_decoded:
+            dets = self._postprocess_decoded_det(det_raw)
+        else:
+            pred = self._decode_with_cache(det_raw, [a0, a1, a2])
+            nms_out = _non_max_suppression(pred, self.conf_thresh, self.iou_thresh)
+            dets = nms_out[0] if len(nms_out) else np.zeros((0, 6), dtype=np.float32)
 
         if dets.size == 0:
             return [], da_mask, lane_mask
 
-        # Scale to original frame size
-        sx = orig_w / model_w
-        sy = orig_h / model_h
-        dets[:, [0, 2]] *= sx
-        dets[:, [1, 3]] *= sy
+        # Undo letterbox padding and scale to original frame size.
+        dets[:, [0, 2]] = (dets[:, [0, 2]] - pad_x) / scale
+        dets[:, [1, 3]] = (dets[:, [1, 3]] - pad_y) / scale
+        dets[:, [0, 2]] = np.clip(dets[:, [0, 2]], 0, orig_w - 1)
+        dets[:, [1, 3]] = np.clip(dets[:, [1, 3]], 0, orig_h - 1)
 
         detections = []
         for x1, y1, x2, y2, conf, cls_id in dets:

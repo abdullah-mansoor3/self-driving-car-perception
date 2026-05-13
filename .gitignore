@@ -1,5 +1,5 @@
 # Models (large binary files — download via scripts/download_models.py)
-models/
+models/*
 _yolopv2_repo/
 _depth_anything_repo/
 _depth_anything_repo/*
@@ -9,6 +9,12 @@ test_footage/
 _depth_anything_repo/
 data/
 .agents/
+
+!models/
+!models/yolop_finetuned_int8.onnx
+!models/yolop_finetuned.onnx
+!models/yolop_finetuned.onnx.data
+!models/yolop_finetuned.pt
 
 # Python
 __pycache__/
